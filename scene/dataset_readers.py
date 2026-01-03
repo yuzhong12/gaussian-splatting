@@ -33,6 +33,7 @@ class CameraInfo(NamedTuple):
     image_path: str
     image_name: str
     depth_path: str
+    mask_path: str   # [新增] 增加 mask 路径字段
     width: int
     height: int
     is_test: bool
@@ -68,7 +69,8 @@ def getNerfppNorm(cam_info):
 
     return {"translate": translate, "radius": radius}
 
-def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_folder, depths_folder, test_cam_names_list):
+# [修改] 增加了 masks_folder 参数
+def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_folder, masks_folder, depths_folder, test_cam_names_list):
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
@@ -106,11 +108,39 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
                 print("\n", key, "not found in depths_params")
 
         image_path = os.path.join(images_folder, extr.name)
+        
+        # 如果找不到这个 jpg 文件，尝试把后缀换成 png 找找看
+        # 修复 sparse 重建点云和图像文件后缀不一致的问题
+        if not os.path.exists(image_path):
+            if extr.name.lower().endswith(".jpg") or extr.name.lower().endswith(".jpeg"):
+                # 把 .jpg 换成 .png
+                base_name = os.path.splitext(extr.name)[0]
+                png_name = base_name + ".png"
+                png_path = os.path.join(images_folder, png_name)
+                
+                if os.path.exists(png_path):
+                    image_path = png_path
+                    # 注意：image_name 保持不变，因为它是用来做 ID 索引的       
+        
         image_name = extr.name
         depth_path = os.path.join(depths_folder, f"{extr.name[:-n_remove]}.png") if depths_folder != "" else ""
-
+        
+        # [新增] 寻找同名 mask 文件的逻辑
+        mask_path = ""
+        if masks_folder != "":
+            # 你的 mask 是 jpg 且同名，extr.name 通常包含后缀 (如 001.jpg)
+            # 我们直接拼接路径检查文件是否存在
+            potential_mask_path = os.path.join(masks_folder, extr.name)
+            
+            if os.path.exists(potential_mask_path):
+                mask_path = potential_mask_path
+            else:
+                # 备用方案：万一扩展名大小写不一致 (比如 .JPG vs .jpg)，可以尝试忽略后缀匹配（可选，这里先只做精确匹配）
+                pass
+        
+        # [修改] 在 CameraInfo 中增加 mask_path 字段
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, depth_params=depth_params,
-                              image_path=image_path, image_name=image_name, depth_path=depth_path,
+                              image_path=image_path, image_name=image_name, depth_path=depth_path, mask_path=mask_path,
                               width=width, height=height, is_test=image_name in test_cam_names_list)
         cam_infos.append(cam_info)
 
@@ -191,9 +221,17 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
         test_cam_names_list = []
 
     reading_dir = "images" if images == None else images
+    
+    # [新增] 设置 masks 文件夹路径，假设它位于 dataset 根目录下，名为 "masks"
+    masks_dir = os.path.join(path, "masks")
+    if not os.path.exists(masks_dir):
+        masks_dir = "" # 如果没有 masks 文件夹，则传空字符串    
+    
+    # [修改] 在 readColmapCameras 中传入 masks_dir 参数
     cam_infos_unsorted = readColmapCameras(
         cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, depths_params=depths_params,
         images_folder=os.path.join(path, reading_dir), 
+        masks_folder=masks_dir, # 传入 masks 路径
         depths_folder=os.path.join(path, depths) if depths != "" else "", test_cam_names_list=test_cam_names_list)
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
@@ -264,9 +302,11 @@ def readCamerasFromTransforms(path, transformsfile, depths_folder, white_backgro
 
             depth_path = os.path.join(depths_folder, f"{image_name}.png") if depths_folder != "" else ""
 
+            # [修改] 保持接口一致，补充 mask_path 参数（设为空）
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX,
                             image_path=image_path, image_name=image_name,
-                            width=image.size[0], height=image.size[1], depth_path=depth_path, depth_params=None, is_test=is_test))
+                            width=image.size[0], height=image.size[1], depth_path=depth_path, 
+                            mask_path="", depth_params=None, is_test=is_test))
             
     return cam_infos
 
