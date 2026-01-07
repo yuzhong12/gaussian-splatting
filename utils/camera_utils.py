@@ -18,8 +18,10 @@ import cv2
 WARNED = False
 
 def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dataset):
+    # 读取图片 (保持原样)
     image = Image.open(cam_info.image_path)
 
+    # 读取深度图 (保持原样)
     if cam_info.depth_path != "":
         try:
             if is_nerf_synthetic:
@@ -39,6 +41,7 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
     else:
         invdepthmap = None
         
+    # 计算分辨率 (保持原样)
     orig_w, orig_h = image.size
     if args.resolution in [1, 2, 4, 8]:
         resolution = round(orig_w/(resolution_scale * args.resolution)), round(orig_h/(resolution_scale * args.resolution))
@@ -60,13 +63,29 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
         scale = float(global_down) * float(resolution_scale)
         resolution = (int(orig_w / scale), int(orig_h / scale))
 
-    # [修改] 在这里将 cam_info.mask_path 传递给 Camera 构造函数
-    return Camera(resolution, colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
-                  FoVx=cam_info.FovX, FoVy=cam_info.FovY, depth_params=cam_info.depth_params,
-                  image=image, invdepthmap=invdepthmap,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device,
-                  train_test_exp=args.train_test_exp, is_test_dataset=is_test_dataset, is_test_view=cam_info.is_test,
-                  mask_path=cam_info.mask_path)  # <--- 这里增加了 mask_path
+    # --- 核心修改部分 START ---
+    
+    # 这里的关键是把 cam_info.gt_alpha_mask 传给 Camera
+    # 我们之前在 dataset_readers.py 里把 mask 存到了 cam_info 中
+    
+    return Camera(resolution, 
+                  colmap_id=cam_info.uid, 
+                  R=cam_info.R, 
+                  T=cam_info.T, 
+                  FoVx=cam_info.FovX, 
+                  FoVy=cam_info.FovY, 
+                  depth_params=cam_info.depth_params,
+                  image=image, 
+                  gt_alpha_mask=cam_info.gt_alpha_mask,  # <--- [新增] 传递 Mask
+                  invdepthmap=invdepthmap,
+                  image_name=cam_info.image_name, 
+                  uid=id, 
+                  data_device=args.data_device,
+                  train_test_exp=args.train_test_exp, 
+                  is_test_dataset=is_test_dataset, 
+                  is_test_view=cam_info.is_test)
+
+    # --- 核心修改部分 END ---
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args, is_nerf_synthetic, is_test_dataset):
     camera_list = []

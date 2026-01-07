@@ -106,17 +106,32 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if (iteration - 1) == debug_from:
             pipe.debug = True
 
+        # 1. 获取随机背景颜色 (如果启用了 random_background)
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
-        if viewpoint_cam.alpha_mask is not None:
-            alpha_mask = viewpoint_cam.alpha_mask.cuda()
-            image *= alpha_mask
+        # --- [修改 1] 删除或注释掉这段 ---
+        # 原代码这里会强制把渲染结果的 Mask 区域外置 0。
+        # 但我们需要它是随机背景色，所以这段必须去掉！
+        # if viewpoint_cam.alpha_mask is not None:
+        #     alpha_mask = viewpoint_cam.alpha_mask.cuda()
+        #     image *= alpha_mask
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
+
+        # --- [修改 2] 核心逻辑：动态合成 Ground Truth ---
+        # 如果当前相机有 Mask (我们在 cameras.py 里加的 gt_alpha_mask)
+        if hasattr(viewpoint_cam, "gt_alpha_mask") and viewpoint_cam.gt_alpha_mask is not None:
+             # 取出 Mask
+             mask = viewpoint_cam.gt_alpha_mask.cuda()
+             # 公式：GT = (原图 * Mask) + (随机背景 * (1 - Mask))
+             # 这样 GT 的背景就和渲染器的背景 bg 一模一样了
+             gt_image = gt_image * mask + bg[:, None, None] * (1.0 - mask)
+        # -------------------------------------------
+
         Ll1 = l1_loss(image, gt_image)
         if FUSED_SSIM_AVAILABLE:
             ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
@@ -217,6 +232,15 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 
+    # --- Masked PSNR 计算函数 ---
+    def psnr_masked_func(img, gt, mask):
+        mask_binary = (mask > 0.5).float()
+        valid_pixels = mask_binary.sum() * 3.0
+        if valid_pixels == 0: return 0.0
+        mse = ((img - gt)**2 * mask_binary).sum() / valid_pixels
+        psnr = 20 * torch.log10(1.0 / torch.sqrt(mse + 1e-6))
+        return psnr.item()
+
     # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
@@ -227,24 +251,65 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
+                psnr_masked_test = 0.0
+                
                 for idx, viewpoint in enumerate(config['cameras']):
-                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
+                    # --- 核心修改逻辑 ---
+                    
+                    # 1. 强制创建一个黑色背景用于评估
+                    # 无论训练时怎么随机，评估时我们统一用黑色，保证指标稳定
+                    black_bg = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
+                    
+                    # 2. 使用黑色背景进行渲染
+                    # 注意：这里我们覆盖了 renderArgs 里的背景，强制使用 black_bg
+                    render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs[:1], black_bg, *renderArgs[2:])
+                    image = torch.clamp(render_pkg["render"], 0.0, 1.0)
+                    
+                    # 3. 准备 GT 图片
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                    
+                    # 4. 获取 Mask
+                    if hasattr(viewpoint, "gt_alpha_mask") and viewpoint.gt_alpha_mask is not None:
+                        mask = viewpoint.gt_alpha_mask.cuda()
+                        
+                        # 【关键】利用 Mask 将 GT 的背景也变成纯黑
+                        # 公式: GT = 原图 * Mask + 黑背景 * (1-Mask)
+                        # 因为黑背景是0，所以简写为: GT = 原图 * Mask
+                        gt_image = gt_image * mask
+                        
+                        # 此时：
+                        # image 是 "前景 + 黑色背景" (由渲染器生成)
+                        # gt_image 是 "前景 + 黑色背景" (由 Mask 抠出)
+                        # 两者现在可以公平比较了！
+                    else:
+                        mask = torch.ones_like(image[0:1, ...])
+
+                    # 5. 计算指标
                     if train_test_exp:
                         image = image[..., image.shape[-1] // 2:]
                         gt_image = gt_image[..., gt_image.shape[-1] // 2:]
+                        mask = mask[..., mask.shape[-1] // 2:]
+
+                    l1_test += l1_loss(image, gt_image).mean().double()
+                    psnr_test += psnr(image, gt_image).mean().double()
+                    psnr_masked_test += psnr_masked_func(image, gt_image, mask) # 计算只看车身的 PSNR
+
                     if tb_writer and (idx < 5):
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
-                    l1_test += l1_loss(image, gt_image).mean().double()
-                    psnr_test += psnr(image, gt_image).mean().double()
+
                 psnr_test /= len(config['cameras'])
+                psnr_masked_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])          
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                
+                print("\n[ITER {}] Evaluating {}: L1 {:.4f} PSNR {:.4f} | Masked PSNR {:.4f}".format(
+                    iteration, config['name'], l1_test, psnr_test, psnr_masked_test))
+                
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - masked_psnr', psnr_masked_test, iteration)
 
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
